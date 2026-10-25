@@ -20,13 +20,16 @@ const LAYOUT_PROMPT = `あなたは家具の組み立て説明書を解析する
 添付画像は説明書PDFの最初の数ページ（1枚目が1ページ目）です。次を読み取り、JSONだけを出力してください（説明文やコードブロックは不要）。
 
 1. title: 家具の名前。
-2. assemblyStartPage: 番号付きの組み立て手順（1番の手順）が最初に載っているページ番号（1始まり）。表紙・安全上の注意・部品一覧・道具の図のページは含めない。
+2. assemblyStartPage: 番号付きの組み立て手順（1番の手順）が最初に載っているページ番号（1始まり）。表紙・安全上の注意・部品一覧・道具の図だけのページは含めない。部品一覧と手順が同じページにあるなら、そのページの番号にする。
 3. parts: 説明書に載っている部品の一覧。
 
 部品ごとの項目:
 - id: 説明書の部品記号（A,B,C…や①②…）。name: 日本語の部品名。qty: 個数。
 - kind: "board"（板・箱）、"rod"（丸棒・角材・脚などの細長い部材）、"screw"（ネジ・ボルト・ダボなどの小さな留め具）のどれか。
-- dims: 寸法(mm)の配列。説明書に寸法があれば必ずその数値を使う。board は [厚み, 幅, 長さ]、rod と screw は [直径, 直径, 長さ]。書いていなければ完成図の比率から、現実的な大きさで推定する。
+- 六角レンチ・ドライバーなどの道具は parts に入れない。
+- dims: 寸法(mm)の配列。board は [厚み, 幅, 長さ]、rod と screw は [直径, 直径, 長さ]。
+- dims_source: 寸法が説明書に文字で書かれていれば "printed"、書かれていなくて自分で推定したなら "estimated"。
+- 寸法が書かれていないときは、細かい数値を作らず、一般的な家具の大きさ(mm)で推定する。目安: 椅子の座面 400×400×40、座面の高さ約450、背もたれの高さ約850、机の天板 1200×600×18、脚の高さ約700、脚の太さ約35、棚板 幅600×奥行300×厚み18。
 
 向きと位置のルール（座標の数字は書かない）:
 - 軸は x=左右、y=上下、z=前後。家具を正しい向きで床に置いた完成状態で考える。
@@ -39,20 +42,19 @@ const LAYOUT_PROMPT = `あなたは家具の組み立て説明書を解析する
   - align: くっつく面に沿った2軸について、"min"（その軸のマイナス側の端にそろえる）、"max"（プラス側の端にそろえる）、"center"（中央）を指定する。at が top/bottom のときは x と z、left/right のときは y と z、front/back のときは x と y を書く。
   - inset: 端から内側へずらす量(mm)。省略可。
 - 左右や前後に2個ある部品は、1個目と2個目で at を逆（left と right など）にする。
-- 脚は rod で long_axis は "y"。机なら、天板の下面（at:"bottom"）の四隅に付ける。align の x と z を min/max にして、inset で少し内側へ寄せる。
 
 出力例（小さな棚）:
 {
   "title": "ミニ棚",
   "assemblyStartPage": 3,
   "parts": [
-    {"id":"B","name":"底板","kind":"board","qty":1,"dims":[18,300,382],"long_axis":"x","thin_axis":"y","anchor":true},
-    {"id":"A","name":"側板","kind":"board","qty":2,"dims":[18,300,800],"long_axis":"y","thin_axis":"x","placements":[
+    {"id":"B","name":"底板","kind":"board","qty":1,"dims":[18,300,382],"dims_source":"printed","long_axis":"x","thin_axis":"y","anchor":true},
+    {"id":"A","name":"側板","kind":"board","qty":2,"dims":[18,300,800],"dims_source":"printed","long_axis":"y","thin_axis":"x","placements":[
       {"on":"B","at":"left","align":{"y":"min","z":"center"}},
       {"on":"B","at":"right","align":{"y":"min","z":"center"}}]},
-    {"id":"C","name":"天板","kind":"board","qty":1,"dims":[18,300,418],"long_axis":"x","thin_axis":"y","placements":[
+    {"id":"C","name":"天板","kind":"board","qty":1,"dims":[18,300,418],"dims_source":"printed","long_axis":"x","thin_axis":"y","placements":[
       {"on":"A","at":"top","align":{"x":"min","z":"center"}}]},
-    {"id":"E","name":"ネジ M4x30","kind":"screw","qty":8,"dims":[4,4,30]}
+    {"id":"E","name":"ネジ M4x30","kind":"screw","qty":8,"dims":[4,4,30],"dims_source":"printed"}
   ]
 }`;
 
