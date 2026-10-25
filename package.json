@@ -8,7 +8,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "latest",
     "express": "^4.19.2",
-    "pdfjs-dist": "^4.4.168",
+    "pdfjs-dist": "^6.4.299",
     "undici": "^6.19.0"
   }
 }
