@@ -32,8 +32,11 @@ const PALETTE = ['#c8a27a', '#b58a5a', '#d9b98e', '#a67c52', '#e0c9a6', '#8d6a47
 const FASTENER_COLOR = '#ff7a00';
 const Y_AXIS = new THREE.Vector3(0, 1, 0);
 const SCREW_RE = /ネジ|ねじ|ビス|ボルト|ダボ|カム|金具|screw|bolt|dowel/i;
+const TOOL_RE = /レンチ|ドライバー|工具|スパナ|ペンチ|wrench|screwdriver|\btool\b/i;
 const TOP_RE = /天板|甲板|天面|tabletop|table top|\btop\b/i;
 const LEG_RE = /脚|レッグ|\bleg/i;
+const SEAT_RE = /座面|座板|シート|seat/i;
+const CHAIR_BACK_RE = /背もたれ|バックレスト|backrest/i;
 
 $('stepText').style.whiteSpace = 'pre-line';
 $('stepText').style.fontSize = '15px';
@@ -129,6 +132,7 @@ let ghostGroup = null;
 let focusTarget = new THREE.Vector3(0, 40, 0);
 let focusDist = 200;
 let focusUntil = 0;
+let layoutNote = '';       // 配置に自信がないときの注意書き
 
 const vec = (a) => {
   a = a || [];
@@ -160,32 +164,126 @@ function detectScale(parts) {
   return max >= 150 ? { K: 0.1, MM: 1 } : { K: 1, MM: 10 }; // 150以上ならmm入力とみなす
 }
 
-// 表示用の寸法ラベル（PDFに書かれた元の寸法）
+// ---------- 寸法まわり ----------
+// 数値の配列を、小さい順に [最小, 中間, 最大] の3つにそろえる
+function norm3(raw, kind) {
+  const r = raw.slice().sort((a, b) => a - b);
+  if (r.length >= 3) return [r[0], r[1], r[r.length - 1]];
+  if (r.length === 2) return kind === 'board' ? [r[0], r[1], r[1]] : [r[0], r[0], r[1]];
+  return null;
+}
+
+// 部品の寸法(mm)。小さい順に3つ
+function dimsMM(p) {
+  const raw = (p.dims || p.size || []).map((v) => num(v) * MM).filter((v) => v > 0);
+  return norm3(raw, p.kind) || [20, 20, 20];
+}
+
+// 表示用の寸法ラベル。推定したものには「約」を付ける
 function fmtDim(p, mm) {
   const d = (p.dims || p.size || [])
     .map((v) => Math.round(num(v) * mm))
     .filter((v) => v > 0)
     .sort((a, b) => b - a);
   if (!d.length) return '';
-  return normKind(p) === 'board' ? d.join('×') + 'mm' : `φ${d[d.length - 1]}×${d[0]}mm`;
+  const mark = p.estimated ? '約' : '';
+  return mark + (normKind(p) === 'board' ? d.join('×') + 'mm' : `φ${d[d.length - 1]}×${d[0]}mm`);
 }
 
-// 部品の寸法を mm の昇順で返す
-function dimsMM(p) {
-  const d = (p.dims || p.size || [])
-    .map((v) => num(v) * MM)
-    .filter((v) => v > 0)
-    .sort((a, b) => a - b);
-  return d.length ? d : [20, 20, 20];
+// 寸法が書かれていないときに使う、一般的な大きさ(mm)。小さい順
+function priorMM(p, ctx) {
+  const n = p.name || '';
+  if (p.kind === 'board') {
+    if (SEAT_RE.test(n)) return [40, 400, 400];
+    if (CHAIR_BACK_RE.test(n)) return [30, 400, 850];
+    if (TOP_RE.test(n)) return [18, 600, 1200];
+  }
+  if (p.kind === 'rod' && LEG_RE.test(n)) return [35, 35, ctx.top ? 700 : ctx.seat ? 420 : 450];
+  return null;
 }
 
-// ---------- 一般的なレイアウト計算 ----------
-// AIが書いた「向き」と「どの部品のどの面に付くか」から、位置を計算する
+// 向き(long_axis / thin_axis)から、箱の大きさ・向きを決める
 const AXIS = { x: 0, y: 1, z: 2 };
+const axisOf = (v) => AXIS[String(v || '').trim().toLowerCase().charAt(0)];
+
+function extentsMM(p) {
+  const d = dimsMM(p);
+  const rod = p.kind === 'rod';
+  let long = axisOf(p.long_axis);
+  let thin = axisOf(p.thin_axis);
+  if (long === undefined) long = rod ? 1 : 0;
+  const e = [0, 0, 0];
+  if (rod) {
+    e[long] = d[2];
+    [0, 1, 2].forEach((a) => { if (a !== long) e[a] = d[0]; });
+    return { e, size: [d[0], d[2], d[0]], rot: long === 1 ? [0, 0, 0] : long === 0 ? [0, 0, 90] : [90, 0, 0] };
+  }
+  if (thin === undefined || thin === long) thin = [1, 0, 2].find((a) => a !== long);
+  const mid = [0, 1, 2].find((a) => a !== long && a !== thin);
+  e[thin] = d[0];
+  e[long] = d[2];
+  e[mid] = d[1];
+  return { e, size: e.slice(), rot: [0, 0, 0] };
+}
+
+// AIが返した部品を、使える形に整える（道具を除く・寸法の妥当性チェック・単位そろえ）
+function prepareParts(list) {
+  const parts = list
+    .filter((p) => p && p.id != null && !TOOL_RE.test(p.name || ''))
+    .map((p) => ({ ...p, id: String(p.id), kind: normKind(p) }));
+  parts.forEach((p) => { if (!p.dims) p.dims = (p.size || []).slice(); });
+  ({ K, MM } = detectScale(parts));
+
+  const names = parts.map((p) => p.name || '').join(' ');
+  const ctx = { top: TOP_RE.test(names), seat: SEAT_RE.test(names) };
+
+  parts.forEach((p) => {
+    if (p.kind === 'screw') {
+      // ネジの寸法は常にmm（M4x30など）。cmで書かれていそうなら10倍する
+      let r = (p.dims || []).map((v) => num(v)).filter((v) => v > 0);
+      if (r.length && Math.max(...r) < 2) r = r.map((v) => v * 10);
+      const d = norm3(r, 'screw') || [4, 4, 25];
+      const dia = Math.min(Math.max(d[0], 3), 20);
+      const len = Math.min(Math.max(d[2], 8), 120);
+      p.dims = [dia / MM, dia / MM, len / MM];
+      p.size = [dia / MM, len / MM, dia / MM];
+      return;
+    }
+
+    const raw = (p.dims || []).map((v) => num(v) * MM).filter((v) => v > 0);
+    const valid = norm3(raw, p.kind);
+    const prior = priorMM(p, ctx);
+    const est = String(p.dims_source || '').toLowerCase().startsWith('est');
+    const plausible = (v) => {
+      if (!v) return false;
+      if (prior) return v.every((x, i) => x >= prior[i] * 0.4 && x <= prior[i] * 2.5);
+      return v[0] >= 3 && v[2] <= 2400 && v[0] <= (p.kind === 'board' ? 80 : 100);
+    };
+
+    let d = valid;
+    let estimated = false;
+    if (!plausible(d) || (est && prior)) {
+      estimated = true;
+      if (prior) d = prior.slice();
+      else if (valid) {
+        d = valid.map((v) => Math.min(Math.max(v, 5), 2400));
+        if (p.kind === 'board' && d[0] > 80) d[0] = 18;
+        if (p.kind !== 'board' && d[0] > 100) d[0] = 30;
+        d.sort((a, b) => a - b);
+      } else d = p.kind === 'board' ? [18, 300, 600] : [30, 30, 500];
+    } else if (est) estimated = true;
+
+    p.dims = d.map((v) => v / MM);
+    p.estimated = estimated;
+    p.size = extentsMM(p).size.map((v) => v / MM);
+  });
+  return parts;
+}
+
+// ---------- 位置関係からのレイアウト計算 ----------
 const FACE = { top: [1, 1], bottom: [1, -1], left: [0, -1], right: [0, 1], front: [2, 1], back: [2, -1] };
 const OPP = { top: 'bottom', bottom: 'top', left: 'right', right: 'left', front: 'back', back: 'front' };
 const MIRROR = { min: 'max', max: 'min', center: 'center' };
-const axisOf = (v) => AXIS[String(v || '').trim().toLowerCase().charAt(0)];
 
 function attachTo(n, t, pl) {
   const [ax, sg] = FACE[String(pl.at || 'top').toLowerCase()] || FACE.top;
@@ -204,43 +302,47 @@ function attachTo(n, t, pl) {
   return c;
 }
 
+// 結果が家具として成り立っているか（つながっている・重なりすぎない・極端に大きくない）
+function validateNodes(nodes, pendingCount) {
+  if (pendingCount > 0 && nodes.length > 1) return false;
+  const lo = [0, 1, 2].map((a) => Math.min(...nodes.map((n) => n.c[a] - n.h[a])));
+  const hi = [0, 1, 2].map((a) => Math.max(...nodes.map((n) => n.c[a] + n.h[a])));
+  const dim = hi.map((v, i) => v - lo[i]);
+  if (Math.max(...dim) > 3000 || Math.min(...dim) < 80) return false;
+
+  const vol = (n) => 8 * n.h[0] * n.h[1] * n.h[2];
+  let touching = 0;
+  for (const a of nodes) {
+    let near = false;
+    for (const b of nodes) {
+      if (a === b) continue;
+      const gap = [0, 1, 2].map((i) => Math.abs(a.c[i] - b.c[i]) - (a.h[i] + b.h[i]));
+      if (Math.max(...gap) <= 15) near = true;
+      const ov = [0, 1, 2].map((i) => Math.min(a.c[i] + a.h[i], b.c[i] + b.h[i]) - Math.max(a.c[i] - a.h[i], b.c[i] - b.h[i]));
+      if (ov.every((x) => x > 0) && ov[0] * ov[1] * ov[2] > 0.5 * Math.min(vol(a), vol(b))) return false;
+    }
+    if (near) touching++;
+  }
+  return nodes.length < 2 || touching >= nodes.length * 0.8;
+}
+
 function solveLayout(parts) {
   const solids = parts.filter((p) => p.kind !== 'screw');
-  if (!solids.length) return false;
-  // 位置関係がひとつも書かれていなければ使わない
-  if (!solids.some((p) => Array.isArray(p.placements) && p.placements.length)) return false;
+  if (!solids.length) return null;
+  if (!solids.some((p) => Array.isArray(p.placements) && p.placements.length)) return null;
 
   const idMap = {};
   solids.forEach((p) => { idMap[normId(p.id)] = p; });
   const find = (id) => idMap[normId(id)] || solids.find((p) => p.name && p.name === String(id));
 
-  // 1. 個体ごとの箱（大きさと向き）を作る
+  // 1. 個体ごとの箱（大きさと向き）
   const nodes = [];
   solids.forEach((p) => {
-    const d = dimsMM(p);
+    const ex = extentsMM(p);
     const q = clampInt(p.qty, 1, 8);
-    const rod = p.kind === 'rod';
-    let long = axisOf(p.long_axis);
-    let thin = axisOf(p.thin_axis);
-    if (long === undefined) long = rod ? 1 : 0;
-    if (!rod && (thin === undefined || thin === long)) thin = [1, 0, 2].find((a) => a !== long);
-
-    const e = [0, 0, 0];
-    let size, rot;
-    if (rod) {
-      e[long] = d[d.length - 1];
-      [0, 1, 2].forEach((a) => { if (a !== long) e[a] = d[0]; });
-      size = [d[0] / MM, d[d.length - 1] / MM, d[0] / MM];
-      rot = long === 1 ? [0, 0, 0] : long === 0 ? [0, 0, 90] : [90, 0, 0];
-    } else {
-      const mid = [0, 1, 2].find((a) => a !== long && a !== thin);
-      e[thin] = d[0];
-      e[long] = d[d.length - 1];
-      e[mid] = d.length >= 3 ? d[1] : d[d.length - 1];
-      size = e.map((v) => v / MM);
-      rot = [0, 0, 0];
+    for (let i = 0; i < q; i++) {
+      nodes.push({ def: p, i, h: ex.e.map((v) => v / 2), c: null, size: ex.size, rot: ex.rot });
     }
-    for (let i = 0; i < q; i++) nodes.push({ def: p, i, h: e.map((v) => v / 2), c: null, size, rot });
   });
 
   // 2. 基準になる部品（anchor、なければ一番大きい部品）を原点に置く
@@ -279,7 +381,8 @@ function solveLayout(parts) {
     }
     if (!moved) break;
   }
-  if (!resolved) return false;
+  if (!resolved) return null;
+  const pendingCount = pending.length;
 
   // 置けなかった部品は、右側に並べる
   let maxX = Math.max(...nodes.filter((n) => n.c).map((n) => n.c[0] + n.h[0]));
@@ -295,18 +398,68 @@ function solveLayout(parts) {
   const dx = -(lo[0] + hi[0]) / 2, dz = -(lo[1] + hi[1]) / 2;
   nodes.forEach((n) => { n.c = [n.c[0] + dx, n.c[1] - minY, n.c[2] + dz]; });
 
-  // 5. 結果を部品に書き戻す
-  solids.forEach((p) => {
+  return { nodes, good: validateNodes(nodes, pendingCount) };
+}
+
+function applyNodes(parts, nodes) {
+  parts.filter((p) => p.kind !== 'screw').forEach((p) => {
     const mine = nodes.filter((n) => n.def === p).sort((a, b) => a.i - b.i);
+    if (!mine.length) return;
     p.qty = mine.length;
-    p.size = mine[0].size;
+    p.size = mine[0].size.map((v) => v / MM);
     p.instances = mine.map((n) => ({ pos: n.c.map((v) => v / MM), rot: n.rot }));
     p.frame = false;
+  });
+}
+
+// ---------- 椅子の型 ----------
+// 座面と背もたれがあれば、寸法から組み上がりの形を作る
+function chairPreset(parts) {
+  const solids = parts.filter((p) => p.kind !== 'screw');
+  const seat = solids.find((p) => SEAT_RE.test(p.name || ''));
+  const back = solids.find((p) => p !== seat && CHAIR_BACK_RE.test(p.name || ''));
+  if (!seat || !back) return false;
+  const R = (mm) => mm / MM;
+  const legs = solids.filter((p) => p !== seat && p !== back && LEG_RE.test(p.name || ''));
+
+  const sd = dimsMM(seat);
+  const T = Math.min(sd[0], 80), D = sd[1], W = sd[2];
+  const ld = legs.length ? dimsMM(legs[0]) : [35, 35, 420];
+  const legLen = ld[2] >= 250 && ld[2] <= 600 ? ld[2] : 420;
+  const bd = dimsMM(back);
+  const bt = Math.min(bd[0], 60), bw = Math.min(bd[1], W), bh = Math.max(bd[2], 200);
+
+  seat.kind = 'board'; seat.frame = false; seat.qty = 1;
+  seat.size = [R(W), R(T), R(D)];
+  seat.instances = [{ pos: [0, R(legLen + T / 2), 0], rot: [0, 0, 0] }];
+
+  // 背もたれ: 床まで届く高さなら後ろ脚と一体、短ければ座面の上に乗せる
+  const full = bh >= legLen + T + 200;
+  back.kind = 'board'; back.frame = false; back.qty = 1;
+  back.size = [R(bw), R(bh), R(bt)];
+  back.instances = [{ pos: [0, R(full ? bh / 2 : legLen + T + bh / 2), R(-(D / 2 + bt / 2))], rot: [0, 0, 0] }];
+
+  legs.forEach((lp) => {
+    const rear = /後|rear/i.test(lp.name || '');
+    const n = clampInt(lp.qty, 1, 4);
+    const lD = Math.min(Math.max(dimsMM(lp)[0], 20), 60);
+    const corners =
+      n === 1
+        ? [[0, rear ? -1 : 1]]
+        : (rear ? [[-1, -1], [1, -1]] : [[-1, 1], [1, 1], [-1, -1], [1, -1]]).slice(0, n);
+    lp.kind = 'rod'; lp.frame = false;
+    lp.size = [R(lD), R(legLen), R(lD)];
+    lp.qty = corners.length;
+    lp.instances = corners.map(([sx, sz]) => ({
+      pos: [R(sx * (W / 2 - lD / 2 - 20)), R(legLen / 2), R(sz * (D / 2 - lD / 2 - 20))],
+      rot: [0, 0, 0],
+    }));
   });
   return true;
 }
 
-// 位置関係が読み取れなかったときの予備: 天板と脚がある机・テーブル
+// ---------- 机・テーブルの型 ----------
+// 天板と脚があれば、寸法から組み上がりの形を作る
 function tablePreset(parts) {
   const solids = parts.filter((p) => p.kind !== 'screw');
   const leg = solids.find((p) => LEG_RE.test(p.name || ''));
@@ -315,12 +468,12 @@ function tablePreset(parts) {
   const R = (mm) => mm / MM;
 
   const td = dimsMM(top);
-  let T = td[0], D = td[1] ?? td[0], L = td[td.length - 1];
+  let T = td[0], D = td[1], L = td[2];
   if (T > 60) T = 25;
   if (L < 300) { L = 1200; D = 600; T = 18; }
 
   const ld = dimsMM(leg);
-  let H = ld[ld.length - 1], d = ld[0];
+  let H = ld[2], d = ld[0];
   if (H < 200 || H > 1200) H = 700;
   if (d < 8 || d > 100) d = 30;
 
@@ -328,7 +481,7 @@ function tablePreset(parts) {
   const inZ = Math.min(50, D * 0.1);
   const span = Math.max(D - 2 * inZ, 100);
 
-  top.kind = 'board';
+  top.kind = 'board'; top.frame = false;
   top.size = [R(L), R(T), R(D)];
   top.qty = 1;
   top.instances = [{ pos: [0, R(H + T / 2), 0], rot: [0, 0, 0] }];
@@ -355,11 +508,12 @@ function tablePreset(parts) {
   solids.filter((p) => p !== top && p !== leg && p.kind === 'board').forEach((p) => {
     const ad = dimsMM(p);
     const t = ad[0];
-    let h = ad[1] ?? 70;
-    let len = ad[ad.length - 1];
+    let h = ad[1];
+    let len = ad[2];
     if (len > innerSpan || len < innerSpan * 0.5) len = innerSpan;
     h = Math.min(h, 200);
     const q = clampInt(p.qty, 1, 2);
+    p.frame = false;
     p.size = [R(len), R(h), R(t)];
     p.qty = q;
     p.instances = [];
@@ -510,7 +664,7 @@ function makeItem(it) {
   it.mesh.visible = false;
   scene.add(it.mesh);
   const labelText = it.fast
-    ? (it.def.name || 'ネジ')
+    ? `${it.def.id} ${it.def.name || 'ネジ'}`.trim()
     : `${it.def.id} ${it.def.name || ''} ${fmtDim(it.def, MM)}`.trim();
   it.label = makeLabel(labelText, it.fast ? 'rgba(220,100,0,0.95)' : 'rgba(34,68,204,0.92)');
   scene.add(it.label);
@@ -562,15 +716,21 @@ function placeScrew(sc, target, k, total) {
 
 // ---------- データ読み込み ----------
 function loadData(json) {
-  const parts = (json.parts || [])
-    .filter((p) => p && p.id != null)
-    .map((p) => ({ ...p, id: String(p.id), kind: normKind(p) }));
+  const parts = prepareParts(json.parts || []);
   const rawSteps = (json.steps || []).filter((s) => s);
   if (!parts.length || !rawSteps.length) throw new Error('部品または手順が空でした');
 
-  parts.forEach((p) => { if (!p.dims) p.dims = (p.size || []).slice(); }); // 元の寸法を残す（表示用）
-  ({ K, MM } = detectScale(parts));
-  solveLayout(parts) || tablePreset(parts); // 位置関係 → 机の予備 → AIの座標、の順に使う
+  // 配置: 椅子・机の型 → 位置関係の計算 → 仮の並び、の順に使う
+  layoutNote = '';
+  if (!chairPreset(parts) && !tablePreset(parts)) {
+    const sol = solveLayout(parts);
+    if (sol) {
+      applyNodes(parts, sol.nodes);
+      if (!sol.good) layoutNote = ' ※配置は推定です（ずれる場合があります）';
+    } else {
+      layoutNote = ' ※部品の位置関係を読み取れず、仮の並びで表示しています';
+    }
+  }
   clearScene();
 
   const byId = {};
@@ -580,6 +740,7 @@ function loadData(json) {
   // 部品1個ごとの完成位置
   const inst = [];
   const byPart = {};
+  let cursor = 0;
   parts.forEach((p, pi) => {
     if (p.kind === 'screw') return;
     const q = clampInt(p.qty, 1, 8);
@@ -587,8 +748,13 @@ function loadData(json) {
     byPart[p.id] = [];
     for (let i = 0; i < q; i++) {
       const src = (p.instances || [])[i] || {};
-      const pos = Array.isArray(src.pos) ? vec(src.pos) : new THREE.Vector3(i * sz[0] * 1.3, sz[1] / 2, 0);
-      const it = { def: p, defIndex: pi, pose: { pos, quat: quat(src.rot) }, step: Infinity, fast: false, screw: false };
+      let pos;
+      if (Array.isArray(src.pos)) pos = vec(src.pos);
+      else {
+        pos = new THREE.Vector3(cursor + sz[0] / 2, sz[1] / 2, 0); // 配置が無いときは横一列に並べる
+        cursor += sz[0] * 1.3;
+      }
+      const it = { def: p, defIndex: pi, pose: { pos, quat: quat(src.rot || p.rot0) }, step: Infinity, fast: false, screw: false };
       byPart[p.id].push(it);
       inst.push(it);
     }
@@ -772,13 +938,19 @@ function goTo(i) {
   clearAnims();
   clearMarkers();
 
-  const fastCount = step.active.filter((x) => x.fast).length;
+  const shownFast = new Set(); // ネジのラベルは種類ごとに1枚だけ
   let order = 0;
   items.forEach((it) => {
     const isAct = it.step === current;
     const vis = it.step <= current;
     it.mesh.visible = vis;
-    it.label.visible = isAct && (!it.fast || fastCount <= 2);
+
+    let showLabel = isAct;
+    if (isAct && it.fast) {
+      if (shownFast.has(it.def)) showLabel = false;
+      else shownFast.add(it.def);
+    }
+    it.label.visible = showLabel;
 
     // 動く部品は光らせ、すでに付いた部品は半透明にして見分けやすくする
     const dim = vis && !isAct && !it.fast;
@@ -1021,29 +1193,32 @@ $('analyze').onclick = async () => {
     pdfjs.GlobalWorkerOptions.workerSrc = '/pdfjs/pdf.worker.min.mjs';
     const pdf = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
     const n = Math.min(pdf.numPages, MAX_PAGES);
+    const small = n <= 3; // ページ数が少ない説明書は、文字が小さいので大きめの画像で読む
 
     // 1. 部品（名前・寸法・個数・位置関係）と、手順の開始ページ
     $('status').textContent = '部品と寸法を読み取り中…';
-    const head = await renderPages(pdf, 1, Math.min(PARTS_PAGES, n), 1280);
+    const head = await renderPages(pdf, 1, Math.min(PARTS_PAGES, n), small ? 1500 : 1280);
     const base = await callApi({ mode: 'layout', images: head });
     const parts = (base.parts || []).filter((p) => p && p.id != null);
     if (!parts.length) throw new Error('部品を読み取れませんでした');
 
-    const sc = detectScale(parts);
-    const partsInfo = parts.map((p) => ({
-      id: String(p.id), name: p.name, kind: normKind(p), qty: p.qty,
-      dim: normKind(p) === 'screw' ? '' : fmtDim(p, sc.MM),
+    // 手順の解析に渡す部品情報（道具を除き、寸法をそろえたもの）
+    const prepared = prepareParts(parts);
+    const partsInfo = prepared.map((p) => ({
+      id: p.id, name: p.name, kind: p.kind, qty: p.qty,
+      dim: p.kind === 'screw' ? '' : fmtDim(p, MM),
     }));
 
     // 2. 組み立て開始のページから、手順を並列に解析
-    let start = n >= 2 ? Math.min(Math.max(Math.round(num(base.assemblyStartPage, 3)) - 1, 2), n) : 1;
+    const asp = Math.round(num(base.assemblyStartPage, 1));
+    const start = small ? 1 : Math.min(Math.max(asp - 1, 1), n);
     const tasks = [];
     let done = 0, got = 0, failed = 0;
     for (let s = start; s <= n; s += CHUNK) {
       const a = s, b = Math.min(s + CHUNK - 1, n);
       tasks.push(async () => {
         try {
-          const imgs = await renderPages(pdf, a, b, 900);
+          const imgs = await renderPages(pdf, a, b, small ? 1600 : 900);
           const r = await callApi({ mode: 'steps', images: imgs, pageStart: a, pageEnd: b, parts: partsInfo });
           const list = (r.steps || [])
             .filter((st) => st && (st.text || (st.uses || []).length))
@@ -1068,7 +1243,7 @@ $('analyze').onclick = async () => {
     const sec = Math.round((performance.now() - t0) / 1000);
     $('status').textContent =
       `${data.title || '家具'}：部品${data.parts.length}種類、${data.steps.length}ステップ（解析${sec}秒）` +
-      (failed ? ` ※${failed}か所は解析に失敗` : '');
+      (failed ? ` ※${failed}か所は解析に失敗` : '') + layoutNote;
     goTo(0);
   } catch (e) {
     $('status').textContent = 'エラー: ' + e.message;
@@ -1077,17 +1252,35 @@ $('analyze').onclick = async () => {
   }
 };
 
-// サンプル: 本棚（寸法と位置関係だけで組み上がる例）
-$('sample').onclick = () => {
-  stopPlay();
-  loadData({
+// ---------- サンプル（押すたびに切り替わる） ----------
+const SAMPLES = [
+  {
+    // 寸法が書かれていない椅子（AIが寸法を推定した想定）。座面・背もたれ・脚の型で組み上がる
+    title: 'テスト椅子',
+    parts: [
+      { id: '1', name: '座面', kind: 'board', qty: 1, dims: [40, 400, 400], dims_source: 'estimated' },
+      { id: '2', name: '背もたれ', kind: 'board', qty: 1, dims: [30, 400, 850], dims_source: 'estimated' },
+      { id: '3', name: '前脚', kind: 'rod', qty: 2, dims: [35, 35, 420], dims_source: 'estimated' },
+      { id: 'A', name: 'ボルトA', kind: 'screw', qty: 4, dims: [6, 6, 40] },
+      { id: 'B', name: 'ボルトB', kind: 'screw', qty: 4, dims: [6, 6, 25] },
+      { id: 'C', name: 'ボルトC', kind: 'screw', qty: 2, dims: [6, 6, 20] },
+      { id: 'W', name: '六角レンチ', kind: 'screw', qty: 1, dims: [4, 4, 80] },
+    ],
+    steps: [
+      { page: 1, text: '座面①と背もたれ②を、ボルトAを4本使って仮締めで連結します。', uses: [{ id: '1', qty: 1 }, { id: '2', qty: 1 }, { id: 'A', qty: 4 }], into: '1' },
+      { page: 1, text: '補強ボルトCを2本、背もたれと座面の継ぎ目に仮締めで取り付けます。', uses: [{ id: 'C', qty: 2 }], into: '2' },
+      { page: 1, text: '前脚③を2本、ボルトBを4本で座面に仮締めし、全てのボルトを本締めします。', uses: [{ id: '3', qty: 2 }, { id: 'B', qty: 4 }], into: '1' },
+    ],
+  },
+  {
+    // 位置関係だけで組み上がる本棚（椅子・机の型を使わない一般的な計算）
     title: 'テスト本棚',
     parts: [
-      { id: 'B', name: '底板', kind: 'board', qty: 1, dims: [18, 300, 382], long_axis: 'x', thin_axis: 'y', anchor: true },
-      { id: 'A', name: '側板', kind: 'board', qty: 2, dims: [18, 300, 800], long_axis: 'y', thin_axis: 'x', placements: [
+      { id: 'B', name: '底板', kind: 'board', qty: 1, dims: [18, 300, 382], dims_source: 'printed', long_axis: 'x', thin_axis: 'y', anchor: true },
+      { id: 'A', name: '側板', kind: 'board', qty: 2, dims: [18, 300, 800], dims_source: 'printed', long_axis: 'y', thin_axis: 'x', placements: [
         { on: 'B', at: 'left', align: { y: 'min', z: 'center' } },
         { on: 'B', at: 'right', align: { y: 'min', z: 'center' } } ] },
-      { id: 'C', name: '天板', kind: 'board', qty: 1, dims: [18, 300, 418], long_axis: 'x', thin_axis: 'y', placements: [
+      { id: 'C', name: '天板', kind: 'board', qty: 1, dims: [18, 300, 418], dims_source: 'printed', long_axis: 'x', thin_axis: 'y', placements: [
         { on: 'A', at: 'top', align: { x: 'min', z: 'center' } } ] },
       { id: 'E', name: 'ネジ M4x30', kind: 'screw', qty: 8, dims: [4, 4, 30] },
     ],
@@ -1097,8 +1290,15 @@ $('sample').onclick = () => {
       { page: 1, text: '天板C(418×300×18mm)を側板Aの上に乗せます。', uses: [{ id: 'C', qty: 1 }] },
       { page: 1, text: '天板Cをネジ4本で側板Aに固定して完成です。', uses: [{ id: 'E', qty: 4 }], into: 'C' },
     ],
-  });
-  $('status').textContent = 'サンプルを表示中';
+  },
+];
+let sampleNo = 0;
+
+$('sample').onclick = () => {
+  stopPlay();
+  loadData(SAMPLES[sampleNo]);
+  $('status').textContent = `サンプル「${SAMPLES[sampleNo].title}」を表示中（もう一度押すと別の家具）` + layoutNote;
+  sampleNo = (sampleNo + 1) % SAMPLES.length;
   goTo(0);
 };
 
