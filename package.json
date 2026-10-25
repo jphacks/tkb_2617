@@ -1,0 +1,14 @@
+{
+  "name": "furniture-guide",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node --env-file=.env server.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "latest",
+    "express": "^4.19.2",
+    "pdfjs-dist": "^4.4.168",
+    "undici": "^6.19.0"
+  }
+}
